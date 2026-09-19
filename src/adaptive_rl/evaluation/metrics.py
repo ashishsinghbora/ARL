@@ -6,6 +6,20 @@ from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# Backward-compatible re-exports from canonical adaptive_rl.metrics module
+from adaptive_rl.metrics import (
+    EpisodeMetrics as EpisodeMetrics,
+)
+from adaptive_rl.metrics import (
+    EpisodeMetricsAccumulator as EpisodeMetricsAccumulator,
+)
+from adaptive_rl.metrics import (
+    compute_rate as compute_rate,
+)
+from adaptive_rl.metrics import (
+    extract_episode_metrics as extract_episode_metrics,
+)
+
 
 class EvaluationMetrics(BaseModel):
     """Container for reinforcement learning evaluation results.
@@ -14,6 +28,13 @@ class EvaluationMetrics(BaseModel):
     and optional domain-specific telemetry. Metrics unavailable for a given
     environment (e.g. collision_rate in non-spatial environments) are explicitly
     set to None, never silently collapsed into 0.0.
+
+    Rate Denominator Semantics:
+        Outcome rates (success_rate, collision_rate, overflow_rate) are calculated
+        among episodes where the metric is defined (non-None). Episodes where
+        the metric was not tracked or unavailable (None) are excluded from both
+        numerator and denominator. If a metric is unavailable across all episodes
+        (all None), the rate evaluates to None.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -27,13 +48,13 @@ class EvaluationMetrics(BaseModel):
         None,
         ge=0.0,
         le=1.0,
-        description="Fraction of episodes reaching target / satisfying objective (None if unavailable)",
+        description="Fraction of episodes reaching target among episodes where success is defined (None if unavailable)",
     )
     collision_rate: Optional[float] = Field(
         None,
         ge=0.0,
         le=1.0,
-        description="Fraction of episodes ending in collision (None if unavailable)",
+        description="Fraction of episodes ending in collision among episodes where collision is defined (None if unavailable)",
     )
     overflow_rate: Optional[float] = Field(
         None,
@@ -272,3 +293,9 @@ class StandardizedExperimentMetrics(BaseModel):
             else:
                 flat[k] = ""
         return flat
+
+
+__all__ = [
+    "EvaluationMetrics",
+    "StandardizedExperimentMetrics",
+]

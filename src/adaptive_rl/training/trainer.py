@@ -22,6 +22,13 @@ from adaptive_rl.experiments.metadata import (
     ExperimentMetadata,
     save_episodes_csv,
 )
+from adaptive_rl.metrics import (
+    DefaultOutcomePolicy,
+    EpisodeMetrics,
+    EpisodeMetricsAccumulator,
+    OutcomePolicy,
+    TrafficOutcomePolicy,
+)
 from adaptive_rl.training.callbacks import (
     BaseCallback,
     CheckpointCallback,
@@ -43,8 +50,8 @@ class TrainingResult:
     checkpoints: List[Dict[str, Any]] = field(default_factory=list)
     episode_rewards: List[float] = field(default_factory=list)
     episode_lengths: List[int] = field(default_factory=list)
-    success_rate: float = 0.0
-    collision_rate: float = 0.0
+    success_rate: Optional[float] = None
+    collision_rate: Optional[float] = None
     metadata_path: Optional[Path] = None
     episodes_csv_path: Optional[Path] = None
 
@@ -93,6 +100,11 @@ class PPOTrainer(BaseTrainer):
                 self.config.environment.name,
                 **self.config.environment.parameters,
             )
+
+        if "traffic" in self.config.environment.name.lower():
+            self.outcome_policy: OutcomePolicy = TrafficOutcomePolicy()
+        else:
+            self.outcome_policy = DefaultOutcomePolicy()
 
         # 2. Checkpoint management
         checkpoint_dir = self.config.output_dir / "checkpoints" / self.config.name
@@ -160,6 +172,7 @@ class PPOTrainer(BaseTrainer):
         adapter = SB3CallbackAdapter(
             callbacks=self._callbacks,
             algorithm=self.algorithm,
+            outcome_policy=self.outcome_policy,
         )
 
         assert self.config.training is not None
@@ -178,23 +191,37 @@ class PPOTrainer(BaseTrainer):
         finished_at = time.time()
         duration = finished_at - started_at
 
-        # Build per-episode records for CSV export
+        # Build per-episode records for CSV export from canonical EpisodeMetrics
         episode_records: List[EpisodeRecord] = []
         cumulative_ts = 0
-        for i, (rew, length) in enumerate(
-            zip(self.metric_logger.episode_rewards, self.metric_logger.episode_lengths)
-        ):
-            cumulative_ts += length
-            episode_records.append(
-                EpisodeRecord(
-                    episode=i + 1,
-                    reward=float(rew),
-                    length=int(length),
-                    success=False,  # per-episode success not tracked separately at this level
-                    collision=False,
-                    timestep=cumulative_ts,
+        if self.metric_logger.episode_metrics:
+            for i, m in enumerate(self.metric_logger.episode_metrics):
+                cumulative_ts += m.length
+                episode_records.append(
+                    EpisodeRecord(
+                        episode=i + 1,
+                        reward=float(m.reward),
+                        length=int(m.length),
+                        success=m.success,
+                        collision=m.collision,
+                        timestep=cumulative_ts,
+                    )
                 )
-            )
+        else:
+            for i, (rew, length) in enumerate(
+                zip(self.metric_logger.episode_rewards, self.metric_logger.episode_lengths)
+            ):
+                cumulative_ts += length
+                episode_records.append(
+                    EpisodeRecord(
+                        episode=i + 1,
+                        reward=float(rew),
+                        length=int(length),
+                        success=None,
+                        collision=None,
+                        timestep=cumulative_ts,
+                    )
+                )
 
         # Save metadata.json and episodes.csv in metadata subdir
         metadata_dir = self.config.output_dir / "metadata"
@@ -246,7 +273,7 @@ class PPOTrainer(BaseTrainer):
         episodes: int = 10,
         deterministic: bool = True,
     ) -> tuple[float, float]:
-        """Evaluate current policy on the environment.
+        """Evaluate current policy on the environment using canonical EpisodeMetrics.
 
         Args:
             episodes: Number of evaluation episodes.
@@ -255,18 +282,26 @@ class PPOTrainer(BaseTrainer):
         Returns:
             tuple[float, float]: (mean_reward, std_reward)
         """
-        rewards: List[float] = []
+        metrics_list: List[EpisodeMetrics] = []
         for ep in range(episodes):
-            obs, _ = self.env.reset(seed=self.config.seed + ep if self.config.seed else None)
-            ep_reward = 0.0
+            obs, info = self.env.reset(seed=self.config.seed + ep if self.config.seed else None)
+            acc = EpisodeMetricsAccumulator(outcome_policy=self.outcome_policy)
             done = False
             while not done:
                 action, _ = self.algorithm.predict(obs, deterministic=deterministic)
-                obs, reward, terminated, truncated, _ = self.env.step(action)
-                ep_reward += float(reward)
+                obs, reward, terminated, truncated, step_info = self.env.step(action)
+                acc.record_step(
+                    reward=float(reward),
+                    terminated=terminated,
+                    truncated=truncated,
+                    info=step_info,
+                )
                 done = terminated or truncated
-            rewards.append(ep_reward)
 
+            m = acc.finish()
+            metrics_list.append(m)
+
+        rewards = [m.reward for m in metrics_list]
         return float(np.mean(rewards)), float(np.std(rewards))
 
 
@@ -297,6 +332,11 @@ class SACTrainer(BaseTrainer):
                 self.config.environment.name,
                 **self.config.environment.parameters,
             )
+
+        if "traffic" in self.config.environment.name.lower():
+            self.outcome_policy: OutcomePolicy = TrafficOutcomePolicy()
+        else:
+            self.outcome_policy = DefaultOutcomePolicy()
 
         # 2. Checkpoint management
         checkpoint_dir = self.config.output_dir / "checkpoints" / self.config.name
@@ -364,6 +404,7 @@ class SACTrainer(BaseTrainer):
         adapter = SB3CallbackAdapter(
             callbacks=self._callbacks,
             algorithm=self.algorithm,
+            outcome_policy=self.outcome_policy,
         )
 
         assert self.config.training is not None
@@ -382,23 +423,37 @@ class SACTrainer(BaseTrainer):
         finished_at = time.time()
         duration = finished_at - started_at
 
-        # Build per-episode records for CSV export
+        # Build per-episode records for CSV export from canonical EpisodeMetrics
         episode_records: List[EpisodeRecord] = []
         cumulative_ts = 0
-        for i, (rew, length) in enumerate(
-            zip(self.metric_logger.episode_rewards, self.metric_logger.episode_lengths)
-        ):
-            cumulative_ts += length
-            episode_records.append(
-                EpisodeRecord(
-                    episode=i + 1,
-                    reward=float(rew),
-                    length=int(length),
-                    success=False,
-                    collision=False,
-                    timestep=cumulative_ts,
+        if self.metric_logger.episode_metrics:
+            for i, m in enumerate(self.metric_logger.episode_metrics):
+                cumulative_ts += m.length
+                episode_records.append(
+                    EpisodeRecord(
+                        episode=i + 1,
+                        reward=float(m.reward),
+                        length=int(m.length),
+                        success=m.success,
+                        collision=m.collision,
+                        timestep=cumulative_ts,
+                    )
                 )
-            )
+        else:
+            for i, (rew, length) in enumerate(
+                zip(self.metric_logger.episode_rewards, self.metric_logger.episode_lengths)
+            ):
+                cumulative_ts += length
+                episode_records.append(
+                    EpisodeRecord(
+                        episode=i + 1,
+                        reward=float(rew),
+                        length=int(length),
+                        success=None,
+                        collision=None,
+                        timestep=cumulative_ts,
+                    )
+                )
 
         # Save metadata.json and episodes.csv
         metadata_dir = self.config.output_dir / "metadata"
@@ -450,7 +505,7 @@ class SACTrainer(BaseTrainer):
         episodes: int = 10,
         deterministic: bool = True,
     ) -> tuple[float, float]:
-        """Evaluate current policy on the environment.
+        """Evaluate current policy on the environment using canonical EpisodeMetrics.
 
         Args:
             episodes: Number of evaluation episodes.
@@ -459,18 +514,26 @@ class SACTrainer(BaseTrainer):
         Returns:
             tuple[float, float]: (mean_reward, std_reward)
         """
-        rewards: List[float] = []
+        metrics_list: List[EpisodeMetrics] = []
         for ep in range(episodes):
-            obs, _ = self.env.reset(seed=self.config.seed + ep if self.config.seed else None)
-            ep_reward = 0.0
+            obs, info = self.env.reset(seed=self.config.seed + ep if self.config.seed else None)
+            acc = EpisodeMetricsAccumulator(outcome_policy=self.outcome_policy)
             done = False
             while not done:
                 action, _ = self.algorithm.predict(obs, deterministic=deterministic)
-                obs, reward, terminated, truncated, _ = self.env.step(action)
-                ep_reward += float(reward)
+                obs, reward, terminated, truncated, step_info = self.env.step(action)
+                acc.record_step(
+                    reward=float(reward),
+                    terminated=terminated,
+                    truncated=truncated,
+                    info=step_info,
+                )
                 done = terminated or truncated
-            rewards.append(ep_reward)
 
+            m = acc.finish()
+            metrics_list.append(m)
+
+        rewards = [m.reward for m in metrics_list]
         return float(np.mean(rewards)), float(np.std(rewards))
 
 

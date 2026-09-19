@@ -255,6 +255,7 @@ class TrainingStopCallback(BaseCallback):
         episode_reward: float,
         episode_length: int,
         info: Optional[dict[str, Any]] = None,
+        metrics: Optional[Any] = None,
     ) -> None:
         return None
 

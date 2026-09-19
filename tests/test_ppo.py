@@ -175,8 +175,10 @@ def test_metric_logger_callback() -> None:
     assert logger.total_episodes == 3
     assert logger.successes == 1
     assert logger.collisions == 1
-    assert pytest.approx(logger.success_rate) == 1 / 3
-    assert pytest.approx(logger.collision_rate) == 1 / 3
+    # Defined episodes for success: 1 (Ep 1: True, Ep 2: None, Ep 3: None) -> 1/1 = 1.0
+    # Defined episodes for collision: 1 (Ep 1: None, Ep 2: True, Ep 3: None) -> 1/1 = 1.0
+    assert logger.success_rate == 1.0
+    assert logger.collision_rate == 1.0
     assert pytest.approx(logger.mean_reward) == (100.0 - 100.0 + 50.0) / 3
     assert pytest.approx(logger.mean_length) == (10 + 5 + 20) / 3
 

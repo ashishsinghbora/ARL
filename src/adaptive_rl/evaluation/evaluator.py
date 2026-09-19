@@ -14,6 +14,14 @@ from adaptive_rl.algorithms.base import BaseAlgorithm
 from adaptive_rl.environments.registry import make_env
 from adaptive_rl.evaluation.metrics import EvaluationMetrics
 from adaptive_rl.evaluation.scenarios import EvaluationScenario
+from adaptive_rl.metrics import (
+    DefaultOutcomePolicy,
+    EpisodeMetrics,
+    EpisodeMetricsAccumulator,
+    OutcomePolicy,
+    TrafficOutcomePolicy,
+    compute_rate,
+)
 
 
 class BaseEvaluator(ABC):
@@ -39,6 +47,7 @@ class Evaluator(BaseEvaluator):
         env: Optional[gym.Env] = None,
         env_name: Optional[str] = None,
         env_kwargs: Optional[Dict[str, Any]] = None,
+        outcome_policy: Optional[OutcomePolicy] = None,
     ) -> None:
         """Initialize evaluator with algorithm and evaluation environment.
 
@@ -47,6 +56,7 @@ class Evaluator(BaseEvaluator):
             env: Pre-instantiated Gymnasium environment (optional).
             env_name: Registered environment name to instantiate via factory (optional).
             env_kwargs: Additional parameters forwarded to make_env when env_name is used.
+            outcome_policy: Optional explicit domain OutcomePolicy instance.
         """
         self.algorithm = algorithm
         self.env_kwargs = dict(env_kwargs or {})
@@ -74,39 +84,57 @@ class Evaluator(BaseEvaluator):
         else:
             raise ValueError("Evaluator requires either 'env' or 'env_name'.")
 
+        if outcome_policy is not None:
+            self.outcome_policy: OutcomePolicy = outcome_policy
+            self._explicit_policy = True
+        elif "traffic" in self.env_name.lower():
+            self.outcome_policy = TrafficOutcomePolicy()
+            self._explicit_policy = False
+        else:
+            self.outcome_policy = DefaultOutcomePolicy()
+            self._explicit_policy = False
+
+        self.last_episode_metrics: List[EpisodeMetrics] = []
+
+    def _make_episode_accumulator(self) -> EpisodeMetricsAccumulator:
+        """Bind a policy for one episode without treating inferred defaults as explicit.
+
+        Explicit caller-supplied policies are locked on the accumulator. Inferred
+        TrafficOutcomePolicy (from env name) is selected via is_traffic so it is
+        immutable for the episode. Inferred DefaultOutcomePolicy leaves fallback
+        enabled for the first record_step only.
+        """
+        if self._explicit_policy:
+            return EpisodeMetricsAccumulator(outcome_policy=self.outcome_policy)
+        if isinstance(self.outcome_policy, TrafficOutcomePolicy):
+            return EpisodeMetricsAccumulator(is_traffic=True)
+        return EpisodeMetricsAccumulator()
+
     def evaluate(
         self,
         num_episodes: int = 10,
         deterministic: bool = True,
         base_seed: Optional[int] = None,
     ) -> EvaluationMetrics:
-        """Execute deterministic or stochastic multi-episode evaluation benchmark.
+        """Execute evaluation rollouts and compute aggregated metrics.
 
         Args:
-            num_episodes: Total evaluation episodes to run.
+            num_episodes: Number of evaluation episodes to execute.
             deterministic: Whether to use deterministic action selection.
             base_seed: Base seed for reproducible evaluation episode initializations.
 
         Returns:
             EvaluationMetrics: Standardized aggregated performance metrics.
+                Rate denominator semantics: success_rate, collision_rate, and overflow_rate
+                are calculated among episodes where the metric is defined (non-None). If a
+                metric is unavailable across all episodes (all None), the rate evaluates to None.
         """
         if num_episodes <= 0:
             raise ValueError(f"num_episodes must be positive, got {num_episodes}")
 
-        rewards: List[float] = []
-        lengths: List[int] = []
+        episode_metrics: List[EpisodeMetrics] = []
 
-        # Flags tracking whether environments expose specific metrics
-        has_success_info = False
-        has_collision_info = False
-        has_overflow_info = False
-        is_traffic_env = False
-
-        # Per-episode outcomes
-        episode_successes: List[bool] = []
-        episode_collisions: List[bool] = []
-        episode_overflows: List[bool] = []
-        episode_truncations: List[bool] = []
+        is_traffic_env = isinstance(self.outcome_policy, TrafficOutcomePolicy)
 
         # Traffic telemetry accumulators
         all_step_queues: List[int] = []
@@ -120,16 +148,11 @@ class Evaluator(BaseEvaluator):
         for ep in range(num_episodes):
             seed = derive_evaluation_seed(base_seed, ep) if base_seed is not None else None
             obs, info = self.env.reset(seed=seed)
-            ep_reward = 0.0
-            ep_length = 0
+            acc = self._make_episode_accumulator()
             done = False
 
-            ep_had_collision = False
-            ep_had_overflow = False
             ep_step_max_waits: List[int] = []
             last_step_info: Dict[str, Any] = dict(info or {})
-            last_terminated = False
-            last_truncated = False
 
             # Reset policy if policy provides episode-level reset (e.g. PlannerPolicy)
             if hasattr(self.algorithm, "reset_policy"):
@@ -138,76 +161,43 @@ class Evaluator(BaseEvaluator):
             while not done:
                 action, _ = self.algorithm.predict(obs, deterministic=deterministic)
                 obs, reward, terminated, truncated, step_info = self.env.step(action)
-                ep_reward += float(reward)
-                ep_length += 1
+                acc.record_step(
+                    reward=float(reward),
+                    terminated=terminated,
+                    truncated=truncated,
+                    info=step_info,
+                )
                 last_step_info = step_info
-                last_terminated = terminated
-                last_truncated = truncated
 
-                # Track collision
-                if "collision" in step_info:
-                    has_collision_info = True
-                    if step_info["collision"]:
-                        ep_had_collision = True
-
-                # Track overflow
-                if (
-                    "overflow" in step_info
-                    or "had_overflow" in step_info
-                    or "step_overflow" in step_info
-                ):
-                    has_overflow_info = True
-                    if (
-                        step_info.get("overflow")
-                        or step_info.get("had_overflow")
-                        or step_info.get("step_overflow")
-                    ):
-                        ep_had_overflow = True
-
-                # Track traffic telemetry
-                if "total_queue" in step_info:
+                # Track domain-specific traffic telemetry
+                if "total_queue" in step_info or "queue_lengths" in step_info:
                     is_traffic_env = True
-                    all_step_queues.append(int(step_info["total_queue"]))
+                    if not self._explicit_policy and not isinstance(
+                        self.outcome_policy, TrafficOutcomePolicy
+                    ):
+                        # Bind subsequent episodes only; this episode's policy is already locked.
+                        self.outcome_policy = TrafficOutcomePolicy()
+                    if "total_queue" in step_info:
+                        all_step_queues.append(int(step_info["total_queue"]))
                     if "max_wait" in step_info:
                         ep_step_max_waits.append(int(step_info["max_wait"]))
                     if "mean_wait" in step_info:
                         all_step_mean_waits.append(float(step_info["mean_wait"]))
 
-                # Check if environment provides success flag
-                if "success" in step_info:
-                    has_success_info = True
-
                 done = terminated or truncated
 
-            rewards.append(ep_reward)
-            lengths.append(ep_length)
-            episode_truncations.append(last_truncated)
+            m = acc.finish()
+            episode_metrics.append(m)
 
-            if has_collision_info:
-                episode_collisions.append(ep_had_collision)
-
-            if has_overflow_info:
-                episode_overflows.append(ep_had_overflow)
-
-            # Determine EPISODE-LEVEL success outcome:
-            # Success must be an episode-level outcome, never latched from a transient intermediate step.
             if is_traffic_env:
-                # Traffic contract: Episode succeeded iff no queue overflow occurred and final queue was controlled.
-                # An overflowed or early-terminated episode is NEVER successful.
-                traffic_success = (
-                    (not ep_had_overflow)
-                    and (not last_terminated)
-                    and bool(last_step_info.get("success", False))
-                )
-                episode_successes.append(traffic_success)
-                has_success_info = True
                 ep_max_waits.append(max(ep_step_max_waits) if ep_step_max_waits else 0)
                 ep_final_departures.append(int(last_step_info.get("cumulative_departures", 0)))
                 ep_final_delays.append(float(last_step_info.get("cumulative_delay", 0.0)))
-            elif has_success_info:
-                # Goal-directed navigation contract: Success requires reaching goal at termination without collision.
-                goal_success = (not ep_had_collision) and bool(last_step_info.get("success", False))
-                episode_successes.append(goal_success)
+
+        self.last_episode_metrics = episode_metrics
+
+        rewards = [m.reward for m in episode_metrics]
+        lengths = [m.length for m in episode_metrics]
 
         mean_rew = float(np.mean(rewards))
         std_rew = float(np.std(rewards))
@@ -216,16 +206,27 @@ class Evaluator(BaseEvaluator):
         mean_len = float(np.mean(lengths))
         std_len = float(np.std(lengths))
 
-        success_rate: Optional[float] = (
-            float(sum(episode_successes) / num_episodes) if has_success_info else None
+        # Rate aggregation denominator semantics:
+        # Rates (success_rate, collision_rate, overflow_rate) are calculated among defined episodes
+        # (non-None). If a metric is unavailable across all episodes (all None), the rate evaluates to None.
+        has_overflow_info = any("had_overflow" in m.additional_metrics for m in episode_metrics)
+
+        success_rate = compute_rate([m.success for m in episode_metrics])
+        collision_rate = compute_rate([m.collision for m in episode_metrics])
+        overflow_rate = (
+            compute_rate(
+                [
+                    m.additional_metrics["had_overflow"]
+                    for m in episode_metrics
+                    if "had_overflow" in m.additional_metrics
+                ]
+            )
+            if has_overflow_info
+            else None
         )
-        collision_rate: Optional[float] = (
-            float(sum(episode_collisions) / num_episodes) if has_collision_info else None
+        truncation_rate: Optional[float] = float(
+            sum(1 for m in episode_metrics if m.truncated) / num_episodes
         )
-        overflow_rate: Optional[float] = (
-            float(sum(episode_overflows) / num_episodes) if has_overflow_info else None
-        )
-        truncation_rate: Optional[float] = float(sum(episode_truncations) / num_episodes)
 
         additional: Dict[str, Any] = {
             "all_rewards": rewards,

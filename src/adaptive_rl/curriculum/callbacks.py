@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from adaptive_rl.curriculum.curriculum import Curriculum
 from adaptive_rl.curriculum.wrapper import CurriculumEnvWrapper
+from adaptive_rl.metrics import EpisodeMetrics, compute_rate, extract_episode_metrics
 from adaptive_rl.training.callbacks import BaseCallback
 
 
@@ -32,7 +33,7 @@ class CurriculumCallback(BaseCallback):
 
         self.window_size = curriculum.eval_window
         self.recent_rewards: deque[float] = deque(maxlen=self.window_size)
-        self.recent_successes: deque[float] = deque(maxlen=self.window_size)
+        self.recent_successes: deque[Optional[bool]] = deque(maxlen=self.window_size)
 
         self.stage_episodes = 0
         self.stage_timesteps = 0
@@ -46,12 +47,9 @@ class CurriculumCallback(BaseCallback):
         # Check timestep-based timeout trigger
         stage = self.curriculum.current_stage
         if stage.max_timesteps is not None and self.stage_timesteps >= stage.max_timesteps:
+            computed_sr = compute_rate(list(self.recent_successes))
             rolling_metrics = {
-                "success_rate": (
-                    float(sum(self.recent_successes) / len(self.recent_successes))
-                    if self.recent_successes
-                    else 0.0
-                ),
+                "success_rate": computed_sr,
                 "mean_reward": (
                     float(sum(self.recent_rewards) / len(self.recent_rewards))
                     if self.recent_rewards
@@ -84,24 +82,33 @@ class CurriculumCallback(BaseCallback):
         episode_reward: float,
         episode_length: int,
         info: Optional[Dict[str, Any]] = None,
+        metrics: Optional[EpisodeMetrics] = None,
     ) -> None:
         """Update rolling metrics and evaluate stage graduation criteria upon episode completion."""
         self.stage_episodes += 1
         self.recent_rewards.append(episode_reward)
 
-        step_info = info or {}
-        is_success = 1.0 if step_info.get("success", False) else 0.0
-        self.recent_successes.append(is_success)
+        if metrics is None:
+            info_dict = dict(info or {})
+            is_truncated = bool(
+                info_dict.get("TimeLimit.truncated", False) or info_dict.get("truncated", False)
+            )
+            is_terminated = bool(info_dict.get("terminated", not is_truncated))
+            metrics = extract_episode_metrics(
+                reward=episode_reward,
+                length=episode_length,
+                terminated=is_terminated,
+                truncated=is_truncated,
+                info=info_dict,
+            )
+
+        self.recent_successes.append(metrics.success)
 
         mean_reward = float(sum(self.recent_rewards) / len(self.recent_rewards))
-        success_rate = (
-            float(sum(self.recent_successes) / len(self.recent_successes))
-            if self.recent_successes
-            else 0.0
-        )
+        computed_sr = compute_rate(list(self.recent_successes))
 
         rolling_metrics = {
-            "success_rate": success_rate,
+            "success_rate": computed_sr,
             "mean_reward": mean_reward,
             "window_size": len(self.recent_rewards),
         }
@@ -119,10 +126,11 @@ class CurriculumCallback(BaseCallback):
 
             if new_stage is not None:
                 if self.verbose > 0:
+                    sr_str = f"{computed_sr * 100:.1f}%" if computed_sr is not None else "N/A"
                     print(
                         f"\n[Curriculum] >>> ADVANCED to Stage {new_stage.stage_id}: "
                         f"'{new_stage.name}' at timestep {self.total_timesteps} "
-                        f"(SR: {success_rate * 100:.1f}%, Return: {mean_reward:.2f}) <<<"
+                        f"(SR: {sr_str}, Return: {mean_reward:.2f}) <<<"
                     )
 
                 # Reset stage metrics for the new difficulty tier

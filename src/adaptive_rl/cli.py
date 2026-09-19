@@ -1140,8 +1140,16 @@ def benchmark_planners(
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="green", justify="right")
 
-    table.add_row("Success Rate", f"{report.planner_success_rate:.2%}")
-    table.add_row("Collision Rate", f"{report.planner_collision_rate:.2%}")
+    p_sr_str = (
+        f"{report.planner_success_rate:.2%}" if report.planner_success_rate is not None else "N/A"
+    )
+    p_cr_str = (
+        f"{report.planner_collision_rate:.2%}"
+        if report.planner_collision_rate is not None
+        else "N/A"
+    )
+    table.add_row("Success Rate", p_sr_str)
+    table.add_row("Collision Rate", p_cr_str)
     table.add_row("Mean Path Length", f"{report.planner_mean_path_length:.2f}")
     table.add_row("Mean Steps", f"{report.planner_mean_steps:.1f}")
     table.add_row("Mean Planning Time (ms)", f"{report.planner_mean_planning_time_ms:.2f}")

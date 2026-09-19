@@ -20,6 +20,13 @@ from adaptive_rl.curriculum.presets import get_curriculum_preset
 from adaptive_rl.curriculum.stage import CurriculumStage
 from adaptive_rl.curriculum.wrapper import CurriculumEnvWrapper
 from adaptive_rl.environments.registry import make_env
+from adaptive_rl.metrics import (
+    DefaultOutcomePolicy,
+    EpisodeMetrics,
+    EpisodeMetricsAccumulator,
+    OutcomePolicy,
+    TrafficOutcomePolicy,
+)
 from adaptive_rl.training.callbacks import (
     BaseCallback,
     CheckpointCallback,
@@ -128,6 +135,11 @@ class CurriculumTrainer(BaseTrainer):
             )
         training_cfg = self.config.training
 
+        if "traffic" in self.config.environment.name.lower():
+            self.outcome_policy: OutcomePolicy = TrafficOutcomePolicy()
+        else:
+            self.outcome_policy = DefaultOutcomePolicy()
+
         self._callbacks: List[BaseCallback] = [self.metric_logger, self.curriculum_callback]
 
         if training_cfg.checkpoint_freq > 0:
@@ -195,6 +207,7 @@ class CurriculumTrainer(BaseTrainer):
         adapter = SB3CallbackAdapter(
             callbacks=self._callbacks,
             algorithm=self.algorithm,
+            outcome_policy=self.outcome_policy,
         )
 
         assert self.config.training is not None
@@ -238,17 +251,25 @@ class CurriculumTrainer(BaseTrainer):
         episodes: int = 10,
         deterministic: bool = True,
     ) -> tuple[float, float]:
-        """Evaluate policy on current curriculum stage."""
-        rewards: List[float] = []
+        """Evaluate policy on current curriculum stage using canonical EpisodeMetrics."""
+        metrics_list: List[EpisodeMetrics] = []
         for ep in range(episodes):
-            obs, _ = self.env.reset(seed=self.config.seed + ep if self.config.seed else None)
-            ep_reward = 0.0
+            obs, info = self.env.reset(seed=self.config.seed + ep if self.config.seed else None)
+            acc = EpisodeMetricsAccumulator(outcome_policy=self.outcome_policy)
             done = False
             while not done:
                 action, _ = self.algorithm.predict(obs, deterministic=deterministic)
-                obs, reward, terminated, truncated, _ = self.env.step(action)
-                ep_reward += float(reward)
+                obs, reward, terminated, truncated, step_info = self.env.step(action)
+                acc.record_step(
+                    reward=float(reward),
+                    terminated=terminated,
+                    truncated=truncated,
+                    info=step_info,
+                )
                 done = terminated or truncated
-            rewards.append(ep_reward)
 
+            m = acc.finish()
+            metrics_list.append(m)
+
+        rewards = [m.reward for m in metrics_list]
         return float(np.mean(rewards)), float(np.std(rewards))

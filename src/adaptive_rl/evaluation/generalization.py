@@ -14,6 +14,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from adaptive_rl.algorithms.base import BaseAlgorithm
 from adaptive_rl.environments.registry import make_env
 from adaptive_rl.evaluation.metrics import EvaluationMetrics
+from adaptive_rl.metrics import (
+    DefaultOutcomePolicy,
+    EpisodeMetrics,
+    EpisodeMetricsAccumulator,
+    OutcomePolicy,
+    TrafficOutcomePolicy,
+    compute_rate,
+)
 
 
 class GeneralizationDistribution(BaseModel):
@@ -115,6 +123,7 @@ class GeneralizationEvaluator:
         env: Optional[gym.Env] = None,
         env_name: Optional[str] = None,
         env_kwargs: Optional[Dict[str, Any]] = None,
+        outcome_policy: Optional[OutcomePolicy] = None,
     ) -> None:
         """Initialize generalization evaluator.
 
@@ -123,6 +132,7 @@ class GeneralizationEvaluator:
             env: Instantiated Gymnasium environment (optional).
             env_name: Registered environment name (optional).
             env_kwargs: Parameters passed to make_env.
+            outcome_policy: Optional explicit domain OutcomePolicy instance.
         """
         self.algorithm = algorithm
         self.env_kwargs = dict(env_kwargs or {})
@@ -140,54 +150,79 @@ class GeneralizationEvaluator:
         else:
             raise ValueError("GeneralizationEvaluator requires either 'env' or 'env_name'.")
 
+        if outcome_policy is not None:
+            self.outcome_policy: OutcomePolicy = outcome_policy
+            self._explicit_policy = True
+        elif "traffic" in self.env_name.lower():
+            self.outcome_policy = TrafficOutcomePolicy()
+            self._explicit_policy = False
+        else:
+            self.outcome_policy = DefaultOutcomePolicy()
+            self._explicit_policy = False
+
+        self.last_episode_metrics: List[EpisodeMetrics] = []
+        self.last_train_metrics: List[EpisodeMetrics] = []
+        self.last_test_metrics: List[EpisodeMetrics] = []
+
+    def _make_episode_accumulator(self) -> EpisodeMetricsAccumulator:
+        """Bind a policy for one episode without treating inferred defaults as explicit."""
+        if self._explicit_policy:
+            return EpisodeMetricsAccumulator(outcome_policy=self.outcome_policy)
+        if isinstance(self.outcome_policy, TrafficOutcomePolicy):
+            return EpisodeMetricsAccumulator(is_traffic=True)
+        return EpisodeMetricsAccumulator()
+
     def _evaluate_seed_list(
         self,
         seeds: Sequence[int],
         deterministic: bool = True,
     ) -> EvaluationMetrics:
         """Evaluate agent over exact list of seeds, one episode per seed."""
-        rewards: List[float] = []
-        lengths: List[int] = []
-        successes = 0
-        collisions = 0
+        episode_metrics: List[EpisodeMetrics] = []
 
         for seed in seeds:
-            obs, _ = self.env.reset(seed=int(seed))
+            obs, info = self.env.reset(seed=int(seed))
+            acc = self._make_episode_accumulator()
             done = False
-            ep_reward = 0.0
-            ep_len = 0
-            ep_success = False
-            ep_collision = False
 
             while not done:
                 action, _ = self.algorithm.predict(obs, deterministic=deterministic)
                 obs, reward, terminated, truncated, step_info = self.env.step(action)
-                ep_reward += float(reward)
-                ep_len += 1
-
-                if step_info.get("success", False):
-                    ep_success = True
-                if step_info.get("collision", False):
-                    ep_collision = True
-
+                acc.record_step(
+                    reward=float(reward),
+                    terminated=terminated,
+                    truncated=truncated,
+                    info=step_info,
+                )
                 done = terminated or truncated
 
-            rewards.append(ep_reward)
-            lengths.append(ep_len)
-            if ep_success:
-                successes += 1
-            if ep_collision:
-                collisions += 1
+            m = acc.finish()
+            episode_metrics.append(m)
+
+        self.last_episode_metrics = episode_metrics
 
         total = len(seeds)
+        rewards = [m.reward for m in episode_metrics]
+        lengths = [m.length for m in episode_metrics]
+
+        # Rate aggregation denominator semantics:
+        # Rates (success_rate, collision_rate) are calculated among defined episodes (non-None).
+        # If unavailable across all episodes (all None), the rate evaluates to None.
+        success_rate = compute_rate([m.success for m in episode_metrics])
+        collision_rate = compute_rate([m.collision for m in episode_metrics])
+        truncation_rate: Optional[float] = (
+            float(sum(1 for m in episode_metrics if m.truncated) / total) if total > 0 else None
+        )
+
         return EvaluationMetrics(
             episodes=total,
             mean_reward=float(np.mean(rewards)) if rewards else 0.0,
             std_reward=float(np.std(rewards)) if rewards else 0.0,
             min_reward=float(np.min(rewards)) if rewards else 0.0,
             max_reward=float(np.max(rewards)) if rewards else 0.0,
-            success_rate=float(successes / total) if total > 0 else 0.0,
-            collision_rate=float(collisions / total) if total > 0 else 0.0,
+            success_rate=success_rate,
+            collision_rate=collision_rate,
+            truncation_rate=truncation_rate,
             mean_episode_length=float(np.mean(lengths)) if lengths else 0.0,
             std_episode_length=float(np.std(lengths)) if lengths else 0.0,
             additional_metrics={
@@ -218,9 +253,12 @@ class GeneralizationEvaluator:
         train_metrics = self._evaluate_seed_list(
             distribution.train_seeds, deterministic=deterministic
         )
+        self.last_train_metrics = list(self.last_episode_metrics)
+
         test_metrics = self._evaluate_seed_list(
             distribution.test_seeds, deterministic=deterministic
         )
+        self.last_test_metrics = list(self.last_episode_metrics)
 
         if train_metrics.success_rate is not None and test_metrics.success_rate is not None:
             gap_success: Optional[float] = float(

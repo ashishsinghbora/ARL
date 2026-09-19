@@ -6,6 +6,7 @@ from adaptive_rl.experiments.manager import ExperimentManager, ExperimentManifes
 from adaptive_rl.experiments.metadata import (
     EpisodeRecord,
     ExperimentMetadata,
+    load_episodes_csv,
     save_episodes_csv,
 )
 from adaptive_rl.experiments.runner import BaseExperimentRunner
@@ -18,6 +19,7 @@ __all__ = [
     "ExperimentManifest",
     "ExperimentResult",
     "GeneralizationExperimentRunner",
+    "load_episodes_csv",
     "save_episodes_csv",
 ]
 

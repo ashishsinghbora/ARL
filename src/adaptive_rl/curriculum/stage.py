@@ -54,7 +54,8 @@ class CurriculumStage:
 
         if self.success_threshold is not None:
             has_threshold = True
-            current_sr = float(rolling_metrics.get("success_rate", 0.0))
+            sr_val = rolling_metrics.get("success_rate")
+            current_sr = float(sr_val) if sr_val is not None else 0.0
             if current_sr < self.success_threshold:
                 return False
 

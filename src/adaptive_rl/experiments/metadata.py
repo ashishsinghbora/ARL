@@ -42,8 +42,8 @@ class ExperimentMetadata:
         actual_timesteps: Timesteps actually executed.
         episodes_completed: Number of episodes that terminated during training.
         mean_reward: Rolling mean episodic reward at end of training.
-        success_rate: Fraction of episodes that ended in success.
-        collision_rate: Fraction of episodes that ended in collision.
+        success_rate: Fraction of defined episodes that ended in success (None if undefined).
+        collision_rate: Fraction of defined episodes that ended in collision (None if undefined).
         final_model_path: Absolute path to saved final model weights.
         checkpoint_paths: List of intermediate checkpoint paths.
         config_snapshot: Full serialized ExperimentConfig.
@@ -64,9 +64,9 @@ class ExperimentMetadata:
     actual_timesteps: int
     episodes_completed: int
     mean_reward: float
-    success_rate: float
-    collision_rate: float
-    final_model_path: str
+    success_rate: Optional[float] = None
+    collision_rate: Optional[float] = None
+    final_model_path: str = ""
     checkpoint_paths: List[str] = field(default_factory=list)
     config_snapshot: Dict[str, Any] = field(default_factory=dict)
     python_version: str = field(default_factory=lambda: sys.version)
@@ -118,9 +118,9 @@ class EpisodeRecord:
     episode: int
     reward: float
     length: int
-    success: bool
-    collision: bool
-    timestep: int
+    success: Optional[bool] = None
+    collision: Optional[bool] = None
+    timestep: int = 0
 
 
 def save_episodes_csv(
@@ -147,6 +147,52 @@ def save_episodes_csv(
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for rec in records:
-            writer.writerow(asdict(rec))
+            d = asdict(rec)
+            writer.writerow({k: ("" if v is None else v) for k, v in d.items()})
 
     return csv_path
+
+
+def load_episodes_csv(path: str | Path) -> List[EpisodeRecord]:
+    """Read per-episode training records from a CSV file, preserving nullability.
+
+    Empty strings are parsed as None; 'True'/'False' (and numeric 1/0) are parsed
+    as booleans.
+
+    Args:
+        path: Path to the episodes CSV file.
+
+    Returns:
+        List of EpisodeRecord instances with preserved None/bool outcomes.
+    """
+    records: List[EpisodeRecord] = []
+    csv_path = Path(path)
+    if not csv_path.exists():
+        return records
+
+    def _parse_optional_bool(val: Any) -> Optional[bool]:
+        if val is None:
+            return None
+        s = str(val).strip()
+        if s == "" or s.lower() == "none":
+            return None
+        if s.lower() in ("true", "1"):
+            return True
+        if s.lower() in ("false", "0"):
+            return False
+        return None
+
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            records.append(
+                EpisodeRecord(
+                    episode=int(row["episode"]),
+                    reward=float(row["reward"]),
+                    length=int(row["length"]),
+                    success=_parse_optional_bool(row.get("success")),
+                    collision=_parse_optional_bool(row.get("collision")),
+                    timestep=int(row.get("timestep", 0) or 0),
+                )
+            )
+    return records
